@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-svg_to_plotter_gcode.py — SVG to Plotter G-code converter (svg2gcode backend)
+svg_to_plotter_gcode.py - SVG to Plotter G-code converter (svg2gcode backend)
 
 Converts SVG vector drawings to pen-plotter G-code by using svg2gcode to parse
 and optimise SVG paths, then post-processing the output to replace laser
@@ -21,9 +21,9 @@ import re
 from pathlib import Path
 import math
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 # CONVERTER METADATA
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 CONVERTER_INFO = {
     "name": "SVG to Plotter (svg2gcode)",
     "description": (
@@ -35,7 +35,7 @@ CONVERTER_INFO = {
         "paths before processing."
     ),
     "author": "Plotter",
-    "version": "1.1",
+    "version": "1.2",
     "input_types": [["SVG files", "*.svg"], ["All files", "*.*"]],
     "parameters": [
         {
@@ -99,28 +99,28 @@ CONVERTER_INFO = {
             "description": "Z position when pen is up (travelling)"
         },
         {
-            "name": "scale_x",
-            "flag": "--scale-x",
+            "name": "width_mm",
+            "flag": "--width-mm",
             "type": "float",
-            "default": 1.0,
-            "min": 0.1,
-            "max": 10.0,
-            "step": 0.1,
-            "unit": "\u00d7",
-            "label": "Scale X",
-            "description": "Horizontal scale factor applied to the SVG"
+            "default": 100.0,
+            "min": 10.0,
+            "max": 1000.0,
+            "step": 1.0,
+            "unit": "mm",
+            "label": "Output Width",
+            "description": "Output drawing width in mm. Height is computed from aspect ratio."
         },
         {
-            "name": "scale_y",
-            "flag": "--scale-y",
+            "name": "height_scale",
+            "flag": "--height-scale",
             "type": "float",
             "default": 1.0,
             "min": 0.1,
-            "max": 10.0,
+            "max": 5.0,
             "step": 0.1,
-            "unit": "\u00d7",
-            "label": "Scale Y",
-            "description": "Vertical scale factor applied to the SVG"
+            "unit": "ratio",
+            "label": "Height Scale",
+            "description": "Aspect ratio multiplier compared to original image. 1.0 keeps the original aspect ratio."
         },
         {
             "name": "origin_x",
@@ -161,9 +161,102 @@ CONVERTER_INFO = {
     ]
 }
 
-# ═══════════════════════════════════════════════════════════════════
+
+# ===================================================================
+# SVG SIZE DETECTION: Determine physical size in mm (as svg2gcode sees it)
+# ===================================================================
+
+def get_svg_dimensions(svg_path):
+    """
+    Determine the SVG's physical dimensions in millimetres - matching what
+    svg2gcode uses internally as its coordinate space before applying --scale.
+
+    svg2gcode converts all SVG coordinates to mm using the CSS unit rules:
+      - 1px (or unitless) = 1/96 inch = 0.26458 mm
+      - 1pt = 1/72 inch = 0.35278 mm
+      - 1pc = 1/6 inch = 4.2333 mm
+      - 1mm = 1 mm
+      - 1cm = 10 mm
+      - 1in = 25.4 mm
+
+    The physical size determines the output extent at scale=1.0.
+    Our --scale values then multiply this to reach the desired --width-mm.
+
+    Returns (width_mm, height_mm) as svg2gcode would interpret them.
+    """
+    import xml.etree.ElementTree as ET
+
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+
+    # Unit to mm conversion factors (CSS/SVG standard at 96 dpi)
+    UNIT_TO_MM = {
+        'mm': 1.0,
+        'cm': 10.0,
+        'in': 25.4,
+        'pt': 25.4 / 72.0,     # 0.35278
+        'pc': 25.4 / 6.0,      # 4.2333
+        'px': 25.4 / 96.0,     # 0.26458
+    }
+
+    def parse_length_to_mm(val):
+        """Parse an SVG length value and convert to mm."""
+        if val is None:
+            return None
+        val = val.strip()
+        # Handle percentage (unsupported)
+        if val.endswith('%'):
+            return None
+        # Try each unit suffix
+        for unit, factor in UNIT_TO_MM.items():
+            if val.endswith(unit):
+                try:
+                    return float(val[:-len(unit)].strip()) * factor
+                except ValueError:
+                    return None
+        # No unit = treated as px (SVG spec: unitless = px)
+        try:
+            return float(val) * UNIT_TO_MM['px']
+        except ValueError:
+            return None
+
+    width_mm = None
+    height_mm = None
+
+    # Try width/height attributes first
+    w_attr = root.get('width')
+    h_attr = root.get('height')
+
+    width_mm = parse_length_to_mm(w_attr)
+    height_mm = parse_length_to_mm(h_attr)
+
+    # If width/height are valid, use them
+    if width_mm and height_mm and width_mm > 0 and height_mm > 0:
+        return (width_mm, height_mm)
+
+    # Fall back to viewBox (treat viewBox units as px -> convert to mm)
+    viewbox = root.get('viewBox')
+    if viewbox:
+        parts = re.split(r'[\s,]+', viewbox.strip())
+        if len(parts) == 4:
+            try:
+                vb_w = float(parts[2])
+                vb_h = float(parts[3])
+                if vb_w > 0 and vb_h > 0:
+                    # viewBox without width/height: units are px
+                    width_mm = vb_w * UNIT_TO_MM['px']
+                    height_mm = vb_h * UNIT_TO_MM['px']
+                    return (width_mm, height_mm)
+            except ValueError:
+                pass
+
+    # Last resort
+    print("WARNING: Could not determine SVG dimensions, assuming 100x100 mm")
+    return (100.0, 100.0)
+
+# ===================================================================
 # SVG PREPROCESSING: Convert basic shapes to <path> elements
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def preprocess_svg(input_path, tmp_dir):
     """
@@ -330,9 +423,9 @@ def preprocess_svg(input_path, tmp_dir):
     return output_svg
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 # HELPER: Check svg2gcode availability
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def find_svg2gcode():
     """Locate the svg2gcode executable."""
@@ -362,10 +455,9 @@ def find_svg2gcode():
     return None
 
 
-
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 # TRAVEL OPTIMIZATION: Nearest-neighbor path ordering
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def optimize_travel_order(paths):
     """
@@ -444,11 +536,12 @@ def optimize_travel_order(paths):
 
     return [paths[i] for i in order]
 
-# ═══════════════════════════════════════════════════════════════════
-# CORE: Post-process svg2gcode output for plotter
-# ═══════════════════════════════════════════════════════════════════
 
-def postprocess_gcode(raw_gcode_path, output_path, args):
+# ===================================================================
+# CORE: Post-process svg2gcode output for plotter
+# ===================================================================
+
+def postprocess_gcode(raw_gcode_path, output_path, args, output_width_mm, output_height_mm):
     """
     Read the G-code produced by svg2gcode (laser-oriented) and rewrite it
     as plotter-friendly G-code with Z-axis pen up/down movements.
@@ -475,17 +568,17 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
     move_count = 0
     path_count = 0
 
-    # ── Write plotter header ──
+    # -- Write plotter header --
     output_lines.append("; ==========================================")
     output_lines.append("; SVG to Plotter G-code (svg2gcode backend)")
     output_lines.append(f"; Input: {os.path.basename(args.input)}")
+    output_lines.append(f"; Size: {output_width_mm:.1f} x {output_height_mm:.1f} mm")
     output_lines.append(f"; Draw speed: {args.draw_speed} mm/min")
     output_lines.append(f"; Travel speed: {args.travel_speed} mm/min")
     output_lines.append(f"; Z speed: {args.z_speed} mm/min")
     output_lines.append(f"; Pen down Z: {args.pen_down_z} mm")
     output_lines.append(f"; Pen up Z: {args.pen_up_z} mm")
-    if args.scale_x != 1.0 or args.scale_y != 1.0:
-        output_lines.append(f"; Scale: {args.scale_x} x {args.scale_y}")
+    output_lines.append(f"; Width: {args.width_mm} mm | Height scale: {args.height_scale}")
     if args.origin_x != 0.0 or args.origin_y != 0.0:
         output_lines.append(f"; Origin offset: ({args.origin_x}, {args.origin_y}) mm")
     if args.color_coded:
@@ -513,9 +606,7 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
     re_m2 = re.compile(r'^M2\b', re.IGNORECASE)
     re_coord = re.compile(r'[XY]\s*-?\d+\.?\d*', re.IGNORECASE)
 
-    # ── First pass: parse raw G-code into path segments ──
-    # Each segment = [G0 travel-to-start, G1 draw, G1 draw, ...]
-    # The G0 records where the path starts; G1 lines are the drawing moves.
+    # -- First pass: parse raw G-code into path segments --
     path_segments = []   # list of lists of G-code move strings
     current_segment = []
     pen_active = False   # tracks laser on/off in raw gcode
@@ -535,7 +626,7 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
         if re_m2.match(line):
             continue
 
-        # M3/M4 = laser on = start of drawing (don't touch current_segment)
+        # M3/M4 = laser on = start of drawing
         if re_m3.match(line):
             pen_active = True
             continue
@@ -579,24 +670,18 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
     if current_segment:
         path_segments.append(current_segment)
 
-    # ── Optimize path order using nearest-neighbor ──
+    # -- Optimize path order using nearest-neighbor --
     print(f"  Found {len(path_segments)} path segment(s) to optimize...")
     path_segments = optimize_travel_order(path_segments)
 
-    # ── Second pass: emit optimized G-code ──
+    # -- Second pass: emit optimized G-code --
     for segment in path_segments:
         if not segment:
             continue
 
-        # Segment structure: [G0 travel, G1 draw, G1 draw, ...]
-        # 1. Emit G0 travel move(s) with pen up
-        # 2. Pen down
-        # 3. Emit G1 drawing moves
-        # 4. Pen up at end
-
         for gline in segment:
             if gline.startswith("G0"):
-                # Travel move — pen stays up
+                # Travel move - pen stays up
                 output_lines.append(gline)
                 move_count += 1
             else:
@@ -612,7 +697,7 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
             output_lines.append(f"{pen_up_cmd}   ; Pen up")
             pen_is_down = False
 
-    # ── Write plotter footer ──
+    # -- Write plotter footer --
     output_lines.append("")
     if pen_is_down:
         output_lines.append(f"{pen_up_cmd}   ; Pen up (end)")
@@ -626,9 +711,9 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
     return move_count, path_count
 
 
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 # MAIN CONVERSION
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
 
 def convert(args):
     """Main conversion: call svg2gcode then post-process for plotter."""
@@ -644,7 +729,23 @@ def convert(args):
     if not input_path.lower().endswith('.svg'):
         print(f"WARNING: Input file does not have .svg extension: {input_path}")
 
-    print(f"Loading: {input_path}")
+    # -- Determine SVG dimensions and compute scale factors --
+    svg_width, svg_height = get_svg_dimensions(input_path)
+    print(f"SVG native size: {svg_width:.2f} x {svg_height:.2f} (user units)")
+
+    # Compute scale factors from width_mm and height_scale
+    # scale_x maps the SVG width to the desired output width in mm
+    scale_x = args.width_mm / svg_width
+    # scale_y preserves aspect ratio (same as scale_x) then applies height_scale
+    scale_y = scale_x * args.height_scale
+
+    output_width_mm = args.width_mm
+    output_height_mm = svg_height * scale_y
+
+    print(f"Output size: {output_width_mm:.1f} x {output_height_mm:.1f} mm")
+    print(f"Scale factors: X={scale_x:.4f}  Y={scale_y:.4f}")
+
+    print(f"\nLoading: {input_path}")
     print(f"Drawing speed: {args.draw_speed} mm/min")
     print(f"Travel speed: {args.travel_speed} mm/min")
     print(f"Z speed: {args.z_speed} mm/min")
@@ -654,7 +755,7 @@ def convert(args):
     svg2gcode_cmd = find_svg2gcode()
     if svg2gcode_cmd is None:
         print(
-            "ERROR: svg2gcode not found. Install with: pip install svg2gcode",
+            "ERROR: svg2gcode not found. Please ensure svg2gcode is installed and on PATH.",
             file=sys.stderr
         )
         sys.exit(1)
@@ -679,10 +780,9 @@ def convert(args):
         "--nofill",         # Ignore fills (plotter cannot fill areas)
     ]
 
-    # Add scale if not default
-    if args.scale_x != 1.0 or args.scale_y != 1.0:
-        cmd += ["--scale", str(args.scale_x), str(args.scale_y)]
-        print(f"Scale: {args.scale_x} x {args.scale_y}")
+    # Add computed scale factors
+    cmd += ["--scale", str(scale_x), str(scale_y)]
+    print(f"Scale: {scale_x:.4f} x {scale_y:.4f}")
 
     # Add origin offset if set (only when selfcenter is not active)
     if not args.selfcenter and (args.origin_x != 0.0 or args.origin_y != 0.0):
@@ -701,7 +801,6 @@ def convert(args):
     # Color coded actions - translate plotter terms to svg2gcode terms
     if args.color_coded:
         # User specifies "draw" action; translate to "cut" for svg2gcode
-        # (svg2gcode's "cut" = follow the path = what a plotter draws)
         translated = args.color_coded.replace(" = draw", " = cut")
         translated = translated.replace("= draw", "= cut")
         # Remove --pathcut when using color_coded (they conflict in svg2gcode)
@@ -749,8 +848,7 @@ def convert(args):
         sys.exit(1)
     except FileNotFoundError:
         print(
-            "ERROR: svg2gcode executable not found. "
-            "Install with: pip install svg2gcode",
+            "ERROR: svg2gcode executable not found. Ensure svg2gcode is installed.",
             file=sys.stderr
         )
         sys.exit(1)
@@ -781,7 +879,8 @@ def convert(args):
 
     # Post-process: convert laser gcode to plotter gcode
     print("Post-processing for plotter (replacing laser commands with Z-axis moves)...")
-    move_count, path_count = postprocess_gcode(tmp_gcode, output_path, args)
+    move_count, path_count = postprocess_gcode(tmp_gcode, output_path, args,
+                                                output_width_mm, output_height_mm)
 
     # Clean up temp files
     try:
@@ -794,15 +893,16 @@ def convert(args):
 
     final_size = os.path.getsize(output_path)
     print(f"\nConversion complete!")
+    print(f"Output size: {output_width_mm:.1f} x {output_height_mm:.1f} mm")
     print(f"Paths processed: {path_count}")
     print(f"Total moves: {move_count}")
-    print(f"Output size: {final_size} bytes")
+    print(f"Output file size: {final_size} bytes")
     print(f"G-code written to: {output_path}")
 
 
-# ═══════════════════════════════════════════════════════════════════
-# MAIN — handles --get-params and normal execution
-# ═══════════════════════════════════════════════════════════════════
+# ===================================================================
+# MAIN - handles --get-params and normal execution
+# ===================================================================
 
 def main():
     # Protocol: respond to --get-params
@@ -818,7 +918,7 @@ def main():
 Examples:
   %(prog)s drawing.svg output.gcode
   %(prog)s drawing.svg output.gcode --draw-speed 2000 --pen-down-z -2.0
-  %(prog)s drawing.svg output.gcode --scale-x 2.0 --scale-y 2.0
+  %(prog)s drawing.svg output.gcode --width-mm 150 --height-scale 1.0
   %(prog)s drawing.svg output.gcode --color-coded "black = ignore red = draw"
         """
     )
@@ -835,10 +935,10 @@ Examples:
                         help="Z position for pen down in mm (default: -1.0)")
     parser.add_argument("--pen-up-z", type=float, default=3.0, dest="pen_up_z",
                         help="Z position for pen up in mm (default: 3.0)")
-    parser.add_argument("--scale-x", type=float, default=1.0, dest="scale_x",
-                        help="X scale factor (default: 1.0)")
-    parser.add_argument("--scale-y", type=float, default=1.0, dest="scale_y",
-                        help="Y scale factor (default: 1.0)")
+    parser.add_argument("--width-mm", type=float, default=100.0, dest="width_mm",
+                        help="Output drawing width in mm (default: 100). Height is computed from aspect ratio.")
+    parser.add_argument("--height-scale", type=float, default=1.0, dest="height_scale",
+                        help="Height aspect ratio multiplier (default: 1.0 = keep original aspect ratio)")
     parser.add_argument("--origin-x", type=float, default=0.0, dest="origin_x",
                         help="X origin offset in mm (default: 0)")
     parser.add_argument("--origin-y", type=float, default=0.0, dest="origin_y",
