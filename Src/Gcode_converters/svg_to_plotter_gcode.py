@@ -157,19 +157,61 @@ CONVERTER_INFO = {
             "unit": "mm",
             "label": "Rapid Move Threshold",
             "description": "Use G0 rapid moves when travelling more than this distance (0 = disabled)"
+        },
+        {
+            "name": "hatch_fill",
+            "flag": "--hatch-fill",
+            "type": "bool",
+            "default": False,
+            "label": "Hatch Fill",
+            "description": "Fill closed paths with parallel hatch lines"
+        },
+        {
+            "name": "hatch_spacing",
+            "flag": "--hatch-spacing",
+            "type": "float",
+            "default": 2.0,
+            "min": 0.3,
+            "max": 20.0,
+            "step": 0.1,
+            "unit": "mm",
+            "label": "Hatch Spacing",
+            "description": "Distance between hatch lines (in output mm, before scaling)"
+        },
+        {
+            "name": "hatch_angle",
+            "flag": "--hatch-angle",
+            "type": "float",
+            "default": 45.0,
+            "min": 0.0,
+            "max": 180.0,
+            "step": 1.0,
+            "unit": "\u00b0",
+            "label": "Hatch Angle",
+            "description": "Angle of hatch lines in degrees (0 = horizontal, 90 = vertical)"
+        },
+        {
+            "name": "hatch_crosshatch",
+            "flag": "--hatch-crosshatch",
+            "type": "bool",
+            "default": False,
+            "label": "Crosshatch",
+            "description": "Add a second set of hatch lines perpendicular to the first"
         }
     ]
 }
 
 
 # ===================================================================
-# SVG SIZE DETECTION: Determine physical size in mm (as svg2gcode sees it)
+# SVG SIZE DETECTION: Read viewBox/width/height from SVG
 # ===================================================================
 
 def get_svg_dimensions(svg_path):
     """
     Determine the SVG's physical dimensions in millimetres - matching what
     svg2gcode uses internally as its coordinate space before applying --scale.
+
+    Also returns the viewBox dimensions (the coordinate space that SVG paths use).
 
     svg2gcode converts all SVG coordinates to mm using the CSS unit rules:
       - 1px (or unitless) = 1/96 inch = 0.26458 mm
@@ -179,10 +221,9 @@ def get_svg_dimensions(svg_path):
       - 1cm = 10 mm
       - 1in = 25.4 mm
 
-    The physical size determines the output extent at scale=1.0.
-    Our --scale values then multiply this to reach the desired --width-mm.
-
-    Returns (width_mm, height_mm) as svg2gcode would interpret them.
+    Returns (width_mm, height_mm, viewbox_width, viewbox_height).
+    viewbox_width/height are the coordinate-space dimensions that path 'd' values use.
+    If no viewBox is present, viewBox dims equal the unitless width/height numbers.
     """
     import xml.etree.ElementTree as ET
 
@@ -204,55 +245,710 @@ def get_svg_dimensions(svg_path):
         if val is None:
             return None
         val = val.strip()
-        # Handle percentage (unsupported)
         if val.endswith('%'):
             return None
-        # Try each unit suffix
         for unit, factor in UNIT_TO_MM.items():
             if val.endswith(unit):
                 try:
                     return float(val[:-len(unit)].strip()) * factor
                 except ValueError:
                     return None
-        # No unit = treated as px (SVG spec: unitless = px)
         try:
             return float(val) * UNIT_TO_MM['px']
         except ValueError:
             return None
 
+    def parse_length_raw(val):
+        """Strip units and return just the number (for viewBox fallback)."""
+        if val is None:
+            return None
+        val = val.strip()
+        for unit in ['px', 'pt', 'pc', 'mm', 'cm', 'in', 'em', 'ex']:
+            if val.endswith(unit):
+                val = val[:-len(unit)].strip()
+                break
+        if val.endswith('%'):
+            return None
+        try:
+            return float(val)
+        except ValueError:
+            return None
+
     width_mm = None
     height_mm = None
+    viewbox_w = None
+    viewbox_h = None
 
-    # Try width/height attributes first
+    # Parse viewBox
+    viewbox = root.get('viewBox')
+    if viewbox:
+        parts = re.split(r'[\s,]+', viewbox.strip())
+        if len(parts) == 4:
+            try:
+                viewbox_w = float(parts[2])
+                viewbox_h = float(parts[3])
+            except ValueError:
+                pass
+
+    # Parse width/height attributes
     w_attr = root.get('width')
     h_attr = root.get('height')
 
     width_mm = parse_length_to_mm(w_attr)
     height_mm = parse_length_to_mm(h_attr)
 
-    # If width/height are valid, use them
+    # If width/height are valid mm values
     if width_mm and height_mm and width_mm > 0 and height_mm > 0:
-        return (width_mm, height_mm)
+        # If no viewBox, the coordinate space is the raw number from width/height
+        if viewbox_w is None or viewbox_h is None:
+            raw_w = parse_length_raw(w_attr)
+            raw_h = parse_length_raw(h_attr)
+            viewbox_w = raw_w if raw_w else width_mm
+            viewbox_h = raw_h if raw_h else height_mm
+        return (width_mm, height_mm, viewbox_w, viewbox_h)
 
-    # Fall back to viewBox (treat viewBox units as px -> convert to mm)
-    viewbox = root.get('viewBox')
-    if viewbox:
-        parts = re.split(r'[\s,]+', viewbox.strip())
-        if len(parts) == 4:
-            try:
-                vb_w = float(parts[2])
-                vb_h = float(parts[3])
-                if vb_w > 0 and vb_h > 0:
-                    # viewBox without width/height: units are px
-                    width_mm = vb_w * UNIT_TO_MM['px']
-                    height_mm = vb_h * UNIT_TO_MM['px']
-                    return (width_mm, height_mm)
-            except ValueError:
-                pass
+    # Fall back to viewBox (treat as px -> convert to mm)
+    if viewbox_w and viewbox_h and viewbox_w > 0 and viewbox_h > 0:
+        width_mm = viewbox_w * UNIT_TO_MM['px']
+        height_mm = viewbox_h * UNIT_TO_MM['px']
+        return (width_mm, height_mm, viewbox_w, viewbox_h)
 
     # Last resort
     print("WARNING: Could not determine SVG dimensions, assuming 100x100 mm")
-    return (100.0, 100.0)
+    return (100.0, 100.0, 100.0, 100.0)
+
+
+# ===================================================================
+# HATCH FILL: Generate parallel fill lines inside closed paths
+# ===================================================================
+
+def _flatten_cubic_bezier(p0, p1, p2, p3, tolerance=0.5):
+    """Flatten a cubic bezier curve into line segments.
+    Points are (x, y) tuples. Returns list of (x, y) points."""
+    # Use de Casteljau subdivision until flat enough
+    def _subdivide(a, b, c, d, tol, pts):
+        # Check flatness: distance of control points from line a-d
+        ax, ay = a
+        dx, dy = d
+        ux = 3.0*b[0] - 2.0*a[0] - d[0]; uy = 3.0*b[1] - 2.0*a[1] - d[1]
+        vx = 3.0*c[0] - 2.0*d[0] - a[0]; vy = 3.0*c[1] - 2.0*d[1] - a[1]
+        u2 = ux*ux + uy*uy
+        v2 = vx*vx + vy*vy
+        if max(u2, v2) <= 16.0 * tol * tol:
+            pts.append(d)
+            return
+        # Subdivide at t=0.5
+        ab = ((a[0]+b[0])/2, (a[1]+b[1])/2)
+        bc = ((b[0]+c[0])/2, (b[1]+c[1])/2)
+        cd = ((c[0]+d[0])/2, (c[1]+d[1])/2)
+        abc = ((ab[0]+bc[0])/2, (ab[1]+bc[1])/2)
+        bcd = ((bc[0]+cd[0])/2, (bc[1]+cd[1])/2)
+        abcd = ((abc[0]+bcd[0])/2, (abc[1]+bcd[1])/2)
+        _subdivide(a, ab, abc, abcd, tol, pts)
+        _subdivide(abcd, bcd, cd, d, tol, pts)
+
+    pts = [p0]
+    _subdivide(p0, p1, p2, p3, tolerance, pts)
+    return pts
+
+
+def _flatten_quadratic_bezier(p0, p1, p2, tolerance=0.5):
+    """Flatten a quadratic bezier by converting to cubic."""
+    # Q->C: CP1 = P0 + 2/3*(P1-P0), CP2 = P2 + 2/3*(P1-P2)
+    cp1 = (p0[0] + 2.0/3.0*(p1[0]-p0[0]), p0[1] + 2.0/3.0*(p1[1]-p0[1]))
+    cp2 = (p2[0] + 2.0/3.0*(p1[0]-p2[0]), p2[1] + 2.0/3.0*(p1[1]-p2[1]))
+    return _flatten_cubic_bezier(p0, cp1, cp2, p2, tolerance)
+
+
+def _flatten_arc(p0, rx, ry, x_rot, large_arc, sweep, p1, tolerance=0.5):
+    """Flatten an SVG arc into line segments.
+    Implements the SVG arc endpoint-to-center parameterisation."""
+    import math
+
+    x1, y1 = p0
+    x2, y2 = p1
+
+    # Handle degenerate cases
+    if (x1 == x2 and y1 == y2) or rx == 0 or ry == 0:
+        return [p1]
+
+    rx = abs(rx)
+    ry = abs(ry)
+    phi = math.radians(x_rot)
+    cos_phi = math.cos(phi)
+    sin_phi = math.sin(phi)
+
+    # Step 1: compute (x1', y1')
+    dx2 = (x1 - x2) / 2.0
+    dy2 = (y1 - y2) / 2.0
+    x1p = cos_phi * dx2 + sin_phi * dy2
+    y1p = -sin_phi * dx2 + cos_phi * dy2
+
+    # Step 2: compute (cx', cy')
+    x1p2 = x1p * x1p
+    y1p2 = y1p * y1p
+    rx2 = rx * rx
+    ry2 = ry * ry
+
+    # Ensure radii are large enough
+    lam = x1p2 / rx2 + y1p2 / ry2
+    if lam > 1.0:
+        s = math.sqrt(lam)
+        rx *= s
+        ry *= s
+        rx2 = rx * rx
+        ry2 = ry * ry
+
+    num = max(0, rx2*ry2 - rx2*y1p2 - ry2*x1p2)
+    den = rx2*y1p2 + ry2*x1p2
+    if den == 0:
+        return [p1]
+    sq = math.sqrt(num / den)
+    if large_arc == sweep:
+        sq = -sq
+    cxp = sq * rx * y1p / ry
+    cyp = -sq * ry * x1p / rx
+
+    # Step 3: compute (cx, cy) from (cx', cy')
+    cx = cos_phi * cxp - sin_phi * cyp + (x1 + x2) / 2.0
+    cy = sin_phi * cxp + cos_phi * cyp + (y1 + y2) / 2.0
+
+    # Step 4: compute theta1 and dtheta
+    def angle_vec(ux, uy, vx, vy):
+        n = math.sqrt(ux*ux + uy*uy) * math.sqrt(vx*vx + vy*vy)
+        if n == 0:
+            return 0
+        c = (ux*vx + uy*vy) / n
+        c = max(-1.0, min(1.0, c))
+        a = math.acos(c)
+        if ux*vy - uy*vx < 0:
+            a = -a
+        return a
+
+    theta1 = angle_vec(1, 0, (x1p - cxp)/rx, (y1p - cyp)/ry)
+    dtheta = angle_vec(
+        (x1p - cxp)/rx, (y1p - cyp)/ry,
+        (-x1p - cxp)/rx, (-y1p - cyp)/ry
+    )
+
+    if not sweep and dtheta > 0:
+        dtheta -= 2*math.pi
+    elif sweep and dtheta < 0:
+        dtheta += 2*math.pi
+
+    # Step 5: emit points along the arc
+    n_steps = max(4, int(abs(dtheta) / (2*math.acos(1.0 - tolerance / max(rx, ry))) + 1))
+    pts = []
+    for i in range(1, n_steps + 1):
+        t = theta1 + dtheta * i / n_steps
+        cos_t = math.cos(t)
+        sin_t = math.sin(t)
+        x = cos_phi * rx * cos_t - sin_phi * ry * sin_t + cx
+        y = sin_phi * rx * cos_t + cos_phi * ry * sin_t + cy
+        pts.append((x, y))
+
+    return pts
+
+
+def _parse_transform(transform_str):
+    """Parse an SVG transform attribute into a 3x3 transformation matrix.
+    Supports: translate, scale, rotate, matrix, skewX, skewY.
+    Returns (a, b, c, d, e, f) representing the matrix:
+        [a c e]
+        [b d f]
+        [0 0 1]
+    """
+    import math as _math
+
+    def multiply(m1, m2):
+        """Multiply two 2D affine matrices (each as (a,b,c,d,e,f))."""
+        a1, b1, c1, d1, e1, f1 = m1
+        a2, b2, c2, d2, e2, f2 = m2
+        return (
+            a1*a2 + c1*b2,
+            b1*a2 + d1*b2,
+            a1*c2 + c1*d2,
+            b1*c2 + d1*d2,
+            a1*e2 + c1*f2 + e1,
+            b1*e2 + d1*f2 + f1
+        )
+
+    if not transform_str:
+        return (1, 0, 0, 1, 0, 0)  # Identity
+
+    result = (1, 0, 0, 1, 0, 0)  # Identity
+
+    # Parse individual transforms
+    import re as _re
+    transforms = _re.findall(r'(\w+)\s*\(([^)]*)\)', transform_str)
+
+    for func, args_str in transforms:
+        args = [float(x) for x in _re.split(r'[\s,]+', args_str.strip()) if x]
+
+        if func == 'translate':
+            tx = args[0] if len(args) >= 1 else 0
+            ty = args[1] if len(args) >= 2 else 0
+            m = (1, 0, 0, 1, tx, ty)
+        elif func == 'scale':
+            sx = args[0] if len(args) >= 1 else 1
+            sy = args[1] if len(args) >= 2 else sx
+            m = (sx, 0, 0, sy, 0, 0)
+        elif func == 'rotate':
+            angle = _math.radians(args[0]) if len(args) >= 1 else 0
+            cos_a = _math.cos(angle)
+            sin_a = _math.sin(angle)
+            if len(args) >= 3:
+                cx, cy = args[1], args[2]
+                # rotate around (cx, cy)
+                m = multiply((1, 0, 0, 1, cx, cy),
+                    multiply((cos_a, sin_a, -sin_a, cos_a, 0, 0),
+                             (1, 0, 0, 1, -cx, -cy)))
+            else:
+                m = (cos_a, sin_a, -sin_a, cos_a, 0, 0)
+        elif func == 'matrix':
+            if len(args) >= 6:
+                m = (args[0], args[1], args[2], args[3], args[4], args[5])
+            else:
+                m = (1, 0, 0, 1, 0, 0)
+        elif func == 'skewX':
+            angle = _math.radians(args[0]) if len(args) >= 1 else 0
+            m = (1, 0, _math.tan(angle), 1, 0, 0)
+        elif func == 'skewY':
+            angle = _math.radians(args[0]) if len(args) >= 1 else 0
+            m = (1, _math.tan(angle), 0, 1, 0, 0)
+        else:
+            m = (1, 0, 0, 1, 0, 0)
+
+        result = multiply(result, m)
+
+    return result
+
+
+def _get_element_transform(elem, tree_root):
+    """Get the cumulative transform for an element by walking up the tree.
+    Returns (a, b, c, d, e, f) affine matrix."""
+
+    def multiply(m1, m2):
+        a1, b1, c1, d1, e1, f1 = m1
+        a2, b2, c2, d2, e2, f2 = m2
+        return (
+            a1*a2 + c1*b2,
+            b1*a2 + d1*b2,
+            a1*c2 + c1*d2,
+            b1*c2 + d1*d2,
+            a1*e2 + c1*f2 + e1,
+            b1*e2 + d1*f2 + f1
+        )
+
+    # Build parent map
+    parent_map = {child: parent for parent in tree_root.iter() for child in parent}
+
+    # Collect transforms from element up to root
+    transforms = []
+    current = elem
+    while current is not None:
+        t = current.get('transform', '')
+        if t:
+            transforms.append(_parse_transform(t))
+        current = parent_map.get(current)
+
+    # Multiply in reverse order (root transform first, then children)
+    result = (1, 0, 0, 1, 0, 0)
+    for t in reversed(transforms):
+        result = multiply(result, t)
+
+    return result
+
+
+def _apply_transform_to_polygon(polygon, matrix):
+    """Apply an affine transform matrix to all points in a polygon.
+    Matrix is (a, b, c, d, e, f)."""
+    a, b, c, d, e, f = matrix
+    transformed = []
+    for (x, y) in polygon:
+        nx = a * x + c * y + e
+        ny = b * x + d * y + f
+        transformed.append((nx, ny))
+    return transformed
+
+
+def _parse_svg_path_to_polygons(d_attr, tolerance=0.5):
+    """Parse an SVG path d attribute into a list of closed polygons.
+    Each polygon is a list of (x, y) tuples.
+    Only closed subpaths (ending with Z/z) are returned."""
+    import re as _re
+
+    # Tokenise the d attribute
+    # Matches: command letter OR number (with optional sign, decimal, exponent)
+    tokens = _re.findall(r'[MmZzLlHhVvCcSsQqTtAa]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?', d_attr)
+
+    polygons = []
+    current_poly = []
+    pos = (0.0, 0.0)       # current point
+    start = (0.0, 0.0)     # subpath start (for Z)
+    last_ctrl = None        # last control point for S/T
+    last_cmd = ''
+
+    i = 0
+    def next_num():
+        nonlocal i
+        if i < len(tokens):
+            val = float(tokens[i])
+            i += 1
+            return val
+        return 0.0
+
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.isalpha():
+            cmd = tok
+            i += 1
+        else:
+            # Implicit repeat of previous command
+            cmd = last_cmd
+            if cmd == 'M':
+                cmd = 'L'
+            elif cmd == 'm':
+                cmd = 'l'
+
+        if cmd in ('M', 'm'):
+            # If we have an open polygon from previous subpath, discard it
+            # (we only want closed paths for hatching)
+            x = next_num()
+            y = next_num()
+            if cmd == 'm':
+                pos = (pos[0] + x, pos[1] + y)
+            else:
+                pos = (x, y)
+            start = pos
+            current_poly = [pos]
+            last_ctrl = None
+
+        elif cmd in ('Z', 'z'):
+            pos = start
+            if len(current_poly) >= 3:
+                polygons.append(current_poly[:])
+            current_poly = []
+            last_ctrl = None
+
+        elif cmd in ('L', 'l'):
+            x = next_num()
+            y = next_num()
+            if cmd == 'l':
+                pos = (pos[0] + x, pos[1] + y)
+            else:
+                pos = (x, y)
+            current_poly.append(pos)
+            last_ctrl = None
+
+        elif cmd in ('H', 'h'):
+            x = next_num()
+            if cmd == 'h':
+                pos = (pos[0] + x, pos[1])
+            else:
+                pos = (x, pos[1])
+            current_poly.append(pos)
+            last_ctrl = None
+
+        elif cmd in ('V', 'v'):
+            y = next_num()
+            if cmd == 'v':
+                pos = (pos[0], pos[1] + y)
+            else:
+                pos = (pos[0], y)
+            current_poly.append(pos)
+            last_ctrl = None
+
+        elif cmd in ('C', 'c'):
+            x1 = next_num(); y1 = next_num()
+            x2 = next_num(); y2 = next_num()
+            x = next_num(); y = next_num()
+            if cmd == 'c':
+                p1 = (pos[0]+x1, pos[1]+y1)
+                p2 = (pos[0]+x2, pos[1]+y2)
+                end = (pos[0]+x, pos[1]+y)
+            else:
+                p1 = (x1, y1)
+                p2 = (x2, y2)
+                end = (x, y)
+            pts = _flatten_cubic_bezier(pos, p1, p2, end, tolerance)
+            current_poly.extend(pts)
+            pos = end
+            last_ctrl = p2
+
+        elif cmd in ('S', 's'):
+            x2 = next_num(); y2 = next_num()
+            x = next_num(); y = next_num()
+            # Reflect previous control point
+            if last_ctrl and last_cmd in ('C', 'c', 'S', 's'):
+                p1 = (2*pos[0] - last_ctrl[0], 2*pos[1] - last_ctrl[1])
+            else:
+                p1 = pos
+            if cmd == 's':
+                p2 = (pos[0]+x2, pos[1]+y2)
+                end = (pos[0]+x, pos[1]+y)
+            else:
+                p2 = (x2, y2)
+                end = (x, y)
+            pts = _flatten_cubic_bezier(pos, p1, p2, end, tolerance)
+            current_poly.extend(pts)
+            pos = end
+            last_ctrl = p2
+
+        elif cmd in ('Q', 'q'):
+            x1 = next_num(); y1 = next_num()
+            x = next_num(); y = next_num()
+            if cmd == 'q':
+                p1 = (pos[0]+x1, pos[1]+y1)
+                end = (pos[0]+x, pos[1]+y)
+            else:
+                p1 = (x1, y1)
+                end = (x, y)
+            pts = _flatten_quadratic_bezier(pos, p1, end, tolerance)
+            current_poly.extend(pts)
+            pos = end
+            last_ctrl = p1
+
+        elif cmd in ('T', 't'):
+            x = next_num(); y = next_num()
+            if last_ctrl and last_cmd in ('Q', 'q', 'T', 't'):
+                p1 = (2*pos[0] - last_ctrl[0], 2*pos[1] - last_ctrl[1])
+            else:
+                p1 = pos
+            if cmd == 't':
+                end = (pos[0]+x, pos[1]+y)
+            else:
+                end = (x, y)
+            pts = _flatten_quadratic_bezier(pos, p1, end, tolerance)
+            current_poly.extend(pts)
+            pos = end
+            last_ctrl = p1
+
+        elif cmd in ('A', 'a'):
+            rx_a = next_num(); ry_a = next_num()
+            x_rot = next_num()
+            large_arc = int(next_num())
+            sweep_flag = int(next_num())
+            x = next_num(); y = next_num()
+            if cmd == 'a':
+                end = (pos[0]+x, pos[1]+y)
+            else:
+                end = (x, y)
+            pts = _flatten_arc(pos, rx_a, ry_a, x_rot, large_arc, sweep_flag, end, tolerance)
+            current_poly.extend(pts)
+            pos = end
+            last_ctrl = None
+
+        last_cmd = cmd
+
+    return polygons
+
+
+def _line_polygon_intersections(line_y, polygon):
+    """Find all x-coordinates where a horizontal line at y=line_y
+    intersects the polygon edges. Returns sorted list of x values."""
+    intersections = []
+    n = len(polygon)
+    for i in range(n):
+        p1 = polygon[i]
+        p2 = polygon[(i + 1) % n]
+        y1, y2 = p1[1], p2[1]
+        # Skip horizontal edges
+        if y1 == y2:
+            continue
+        # Check if line_y is within this edge's y range
+        if (y1 <= line_y < y2) or (y2 <= line_y < y1):
+            # Linear interpolation for x at line_y
+            t = (line_y - y1) / (y2 - y1)
+            x = p1[0] + t * (p2[0] - p1[0])
+            intersections.append(x)
+    intersections.sort()
+    return intersections
+
+
+def generate_hatch_lines(polygons, spacing, angle_deg, bounds=None):
+    """Generate hatch fill lines for a list of polygons.
+
+    Args:
+        polygons: list of polygons, each polygon is list of (x,y) tuples
+        spacing: distance between hatch lines in SVG user units
+        angle_deg: angle of hatch lines in degrees
+
+    Returns:
+        list of line segments [(x1,y1,x2,y2), ...]
+    """
+    import math
+
+    if not polygons:
+        return []
+
+    angle_rad = math.radians(angle_deg)
+    cos_a = math.cos(angle_rad)
+    sin_a = math.sin(angle_rad)
+
+    # Rotate all polygons so hatch lines become horizontal
+    def rotate(x, y):
+        return (x*cos_a + y*sin_a, -x*sin_a + y*cos_a)
+
+    def unrotate(x, y):
+        return (x*cos_a - y*sin_a, x*sin_a + y*cos_a)
+
+    rotated_polygons = []
+    all_y = []
+    for poly in polygons:
+        rp = [rotate(p[0], p[1]) for p in poly]
+        rotated_polygons.append(rp)
+        for p in rp:
+            all_y.append(p[1])
+
+    if not all_y:
+        return []
+
+    y_min = min(all_y)
+    y_max = max(all_y)
+
+    # Generate horizontal scan lines in rotated space
+    hatch_segments = []
+    y = y_min + spacing / 2.0
+    line_idx = 0
+    while y < y_max:
+        # Collect intersections from all polygons
+        all_intersections = []
+        for rpoly in rotated_polygons:
+            xs = _line_polygon_intersections(y, rpoly)
+            all_intersections.extend(xs)
+        all_intersections.sort()
+
+        # Pair up intersections (enter/exit)
+        for j in range(0, len(all_intersections) - 1, 2):
+            x1 = all_intersections[j]
+            x2 = all_intersections[j + 1]
+            if abs(x2 - x1) > 0.01:  # Skip degenerate segments
+                # Alternate direction for zigzag (reduces travel)
+                if line_idx % 2 == 0:
+                    p1 = unrotate(x1, y)
+                    p2 = unrotate(x2, y)
+                else:
+                    p1 = unrotate(x2, y)
+                    p2 = unrotate(x1, y)
+                hatch_segments.append((p1[0], p1[1], p2[0], p2[1]))
+
+        y += spacing
+        line_idx += 1
+
+    return hatch_segments
+
+
+def _segments_to_svg_path(segments):
+    """Convert a list of (x1,y1,x2,y2) segments into an SVG path d attribute.
+    Groups consecutive segments that share endpoints to minimise pen lifts."""
+    if not segments:
+        return ""
+
+    # Build path string - each segment is M x1 y1 L x2 y2
+    # But try to chain segments that connect end-to-start
+    parts = []
+    prev_end = None
+    for (x1, y1, x2, y2) in segments:
+        if prev_end and abs(x1 - prev_end[0]) < 0.01 and abs(y1 - prev_end[1]) < 0.01:
+            # Continue from previous endpoint
+            parts.append(f"L {x2:.4f} {y2:.4f}")
+        else:
+            parts.append(f"M {x1:.4f} {y1:.4f} L {x2:.4f} {y2:.4f}")
+        prev_end = (x2, y2)
+
+    return " ".join(parts)
+
+
+def apply_hatch_fill(svg_path, tmp_dir, spacing, angle_deg, crosshatch=False, tolerance=0.5):
+    """Apply hatch fill to all closed paths in an SVG file.
+
+    Parses the SVG, finds closed paths, generates hatch lines, and adds them
+    as new <path> elements to the SVG.
+
+    Args:
+        svg_path: path to the SVG file
+        tmp_dir: temporary directory for output
+        spacing: hatch line spacing in SVG user units
+        angle_deg: hatch angle in degrees
+        crosshatch: if True, add a second pass at angle+90
+        tolerance: bezier flattening tolerance
+
+    Returns:
+        path to the modified SVG file (or original if no hatching needed)
+    """
+    import xml.etree.ElementTree as ET
+
+    print("Applying hatch fill to closed paths...")
+
+    ET.register_namespace('', 'http://www.w3.org/2000/svg')
+    ET.register_namespace('xlink', 'http://www.w3.org/1999/xlink')
+    ET.register_namespace('inkscape', 'http://www.inkscape.org/namespaces/inkscape')
+    ET.register_namespace('sodipodi', 'http://sodipodi.sourceforge.net/DTD/sodipodi-0.0.dtd')
+
+    tree = ET.parse(svg_path)
+    root = tree.getroot()
+
+    svg_ns = '{http://www.w3.org/2000/svg}'
+
+    # Find all path elements with 'd' attributes
+    all_polygons = []
+    path_elements = list(root.iter(f'{svg_ns}path')) + list(root.iter('path'))
+
+    for elem in path_elements:
+        d = elem.get('d', '')
+        if not d:
+            continue
+        # Parse the path into polygons
+        polys = _parse_svg_path_to_polygons(d, tolerance)
+        if not polys:
+            continue
+        # Get cumulative transform for this element (handles nested groups)
+        matrix = _get_element_transform(elem, root)
+        # Apply transform to convert to absolute SVG coordinates
+        is_identity = (abs(matrix[0]-1) < 1e-9 and abs(matrix[1]) < 1e-9 and
+                       abs(matrix[2]) < 1e-9 and abs(matrix[3]-1) < 1e-9 and
+                       abs(matrix[4]) < 1e-9 and abs(matrix[5]) < 1e-9)
+        if not is_identity:
+            polys = [_apply_transform_to_polygon(p, matrix) for p in polys]
+        all_polygons.extend(polys)
+
+    if not all_polygons:
+        print("  No closed paths found for hatch fill")
+        return svg_path
+
+    print(f"  Found {len(all_polygons)} closed subpath(s) to hatch")
+
+    # Generate hatch lines
+    segments = generate_hatch_lines(all_polygons, spacing, angle_deg)
+
+    if crosshatch:
+        segments2 = generate_hatch_lines(all_polygons, spacing, angle_deg + 90.0)
+        segments.extend(segments2)
+        print(f"  Generated {len(segments)} hatch segments (crosshatch)")
+    else:
+        print(f"  Generated {len(segments)} hatch segments")
+
+    if not segments:
+        print("  No hatch segments generated (shapes may be too small)")
+        return svg_path
+
+    # Create SVG path element for the hatch lines
+    hatch_d = _segments_to_svg_path(segments)
+    hatch_elem = ET.SubElement(root, f'{svg_ns}path')
+    hatch_elem.set('d', hatch_d)
+    hatch_elem.set('stroke', '#000000')
+    hatch_elem.set('fill', 'none')
+    hatch_elem.set('stroke-width', '0.5')
+    hatch_elem.set('id', 'hatch-fill')
+
+    # Write modified SVG
+    output_svg = os.path.join(tmp_dir, "hatched.svg")
+    tree.write(output_svg, xml_declaration=True, encoding='unicode')
+
+    print(f"  Hatch fill SVG written")
+    return output_svg
+
 
 # ===================================================================
 # SVG PREPROCESSING: Convert basic shapes to <path> elements
@@ -541,7 +1237,7 @@ def optimize_travel_order(paths):
 # CORE: Post-process svg2gcode output for plotter
 # ===================================================================
 
-def postprocess_gcode(raw_gcode_path, output_path, args, output_width_mm, output_height_mm):
+def postprocess_gcode(raw_gcode_path, output_path, args):
     """
     Read the G-code produced by svg2gcode (laser-oriented) and rewrite it
     as plotter-friendly G-code with Z-axis pen up/down movements.
@@ -572,13 +1268,15 @@ def postprocess_gcode(raw_gcode_path, output_path, args, output_width_mm, output
     output_lines.append("; ==========================================")
     output_lines.append("; SVG to Plotter G-code (svg2gcode backend)")
     output_lines.append(f"; Input: {os.path.basename(args.input)}")
-    output_lines.append(f"; Size: {output_width_mm:.1f} x {output_height_mm:.1f} mm")
+    # Size will be filled in after we measure actual extent
+    size_line_idx = len(output_lines)
+    output_lines.append("; Size: (computing...)")
     output_lines.append(f"; Draw speed: {args.draw_speed} mm/min")
     output_lines.append(f"; Travel speed: {args.travel_speed} mm/min")
     output_lines.append(f"; Z speed: {args.z_speed} mm/min")
     output_lines.append(f"; Pen down Z: {args.pen_down_z} mm")
     output_lines.append(f"; Pen up Z: {args.pen_up_z} mm")
-    output_lines.append(f"; Width: {args.width_mm} mm | Height scale: {args.height_scale}")
+    output_lines.append(f"; Target width: {args.width_mm} mm | Height scale: {args.height_scale}")
     if args.origin_x != 0.0 or args.origin_y != 0.0:
         output_lines.append(f"; Origin offset: ({args.origin_x}, {args.origin_y}) mm")
     if args.color_coded:
@@ -674,22 +1372,95 @@ def postprocess_gcode(raw_gcode_path, output_path, args, output_width_mm, output
     print(f"  Found {len(path_segments)} path segment(s) to optimize...")
     path_segments = optimize_travel_order(path_segments)
 
-    # -- Second pass: emit optimized G-code --
+    # -- Second pass: measure coordinate extent from all segments --
+    re_x = re.compile(r'X\s*(-?\d+\.?\d*)', re.IGNORECASE)
+    re_y = re.compile(r'Y\s*(-?\d+\.?\d*)', re.IGNORECASE)
+
+    x_min = float('inf')
+    x_max = float('-inf')
+    y_min = float('inf')
+    y_max = float('-inf')
+
+    for segment in path_segments:
+        for gline in segment:
+            mx = re_x.search(gline)
+            my = re_y.search(gline)
+            if mx:
+                xv = float(mx.group(1))
+                x_min = min(x_min, xv)
+                x_max = max(x_max, xv)
+            if my:
+                yv = float(my.group(1))
+                y_min = min(y_min, yv)
+                y_max = max(y_max, yv)
+
+    if x_max <= x_min or y_max <= y_min:
+        print("  WARNING: Could not determine coordinate extent!")
+        rescale_x = 1.0
+        rescale_y = 1.0
+        output_width_mm = 0.0
+        output_height_mm = 0.0
+    else:
+        raw_width = x_max - x_min
+        raw_height = y_max - y_min
+        print(f"  Raw G-code extent: {raw_width:.2f} x {raw_height:.2f} (svg2gcode units)")
+
+        # Compute scale to fit desired width, preserving aspect ratio
+        rescale_x = args.width_mm / raw_width
+        rescale_y = rescale_x * args.height_scale
+
+        output_width_mm = args.width_mm
+        output_height_mm = raw_height * rescale_y
+
+        print(f"  Rescale factors: X={rescale_x:.4f}  Y={rescale_y:.4f}")
+        print(f"  Output size: {output_width_mm:.1f} x {output_height_mm:.1f} mm")
+
+    # Update the size line in the header
+    output_lines[size_line_idx] = f"; Size: {output_width_mm:.1f} x {output_height_mm:.1f} mm"
+
+    # -- Third pass: emit scaled G-code --
+    # We shift coordinates so that minimum becomes (0 + origin_offset)
+    x_offset = -x_min if x_min != float('inf') else 0
+    y_offset = -y_min if y_min != float('inf') else 0
+
     for segment in path_segments:
         if not segment:
             continue
 
         for gline in segment:
+            # Scale and offset the coordinates
+            new_parts = []
+            mx = re_x.search(gline)
+            my = re_y.search(gline)
+            xv = (float(mx.group(1)) + x_offset) * rescale_x if mx else None
+            yv = (float(my.group(1)) + y_offset) * rescale_y if my else None
+
+            # Rebuild the G-code line with scaled coordinates
             if gline.startswith("G0"):
-                # Travel move - pen stays up
-                output_lines.append(gline)
+                parts = ["G0"]
+                if xv is not None:
+                    parts.append(f"X{xv:.3f}")
+                if yv is not None:
+                    parts.append(f"Y{yv:.3f}")
+                parts.append(f"F{args.travel_speed}")
+                scaled_line = " ".join(parts)
+            else:
+                parts = ["G1"]
+                if xv is not None:
+                    parts.append(f"X{xv:.3f}")
+                if yv is not None:
+                    parts.append(f"Y{yv:.3f}")
+                parts.append(f"F{args.draw_speed}")
+                scaled_line = " ".join(parts)
+
+            if gline.startswith("G0"):
+                output_lines.append(scaled_line)
                 move_count += 1
             else:
-                # First G1 means we need pen down
                 if not pen_is_down:
                     output_lines.append(f"{pen_down_cmd}   ; Pen down")
                     pen_is_down = True
-                output_lines.append(gline)
+                output_lines.append(scaled_line)
                 move_count += 1
 
         # Lift pen at end of this path segment
@@ -708,7 +1479,7 @@ def postprocess_gcode(raw_gcode_path, output_path, args, output_width_mm, output
     with open(output_path, 'w') as f:
         f.write("\n".join(output_lines) + "\n")
 
-    return move_count, path_count
+    return move_count, path_count, output_width_mm, output_height_mm
 
 
 # ===================================================================
@@ -729,21 +1500,11 @@ def convert(args):
     if not input_path.lower().endswith('.svg'):
         print(f"WARNING: Input file does not have .svg extension: {input_path}")
 
-    # -- Determine SVG dimensions and compute scale factors --
-    svg_width, svg_height = get_svg_dimensions(input_path)
-    print(f"SVG native size: {svg_width:.2f} x {svg_height:.2f} (user units)")
-
-    # Compute scale factors from width_mm and height_scale
-    # scale_x maps the SVG width to the desired output width in mm
-    scale_x = args.width_mm / svg_width
-    # scale_y preserves aspect ratio (same as scale_x) then applies height_scale
-    scale_y = scale_x * args.height_scale
-
-    output_width_mm = args.width_mm
-    output_height_mm = svg_height * scale_y
-
-    print(f"Output size: {output_width_mm:.1f} x {output_height_mm:.1f} mm")
-    print(f"Scale factors: X={scale_x:.4f}  Y={scale_y:.4f}")
+    # -- Read SVG dimensions (used for hatch spacing calculation) --
+    svg_width_mm, svg_height_mm, svg_vb_w, svg_vb_h = get_svg_dimensions(input_path)
+    print(f"SVG physical size: {svg_width_mm:.2f} x {svg_height_mm:.2f} mm")
+    print(f"SVG viewBox size: {svg_vb_w:.2f} x {svg_vb_h:.2f} (coordinate units)")
+    print(f"Target output width: {args.width_mm} mm (height scale: {args.height_scale})")
 
     print(f"\nLoading: {input_path}")
     print(f"Drawing speed: {args.draw_speed} mm/min")
@@ -772,6 +1533,28 @@ def convert(args):
     # Preprocess SVG: convert polyline/polygon/line/rect/circle/ellipse to <path>
     processed_svg = preprocess_svg(input_path, tmp_dir)
 
+    # Apply hatch fill if enabled
+    if args.hatch_fill:
+        # Convert hatch spacing from desired output mm to SVG viewBox units.
+        # Since post-processing scales everything by (width_mm / raw_extent),
+        # and raw_extent comes from svg2gcode processing viewBox coords,
+        # the hatch spacing in viewBox units that produces the desired mm spacing is:
+        #   hatch_svg = desired_mm * (viewBox_w / width_mm) * (raw_extent / viewBox_as_gcode)
+        # Since we can't know raw_extent yet, and hatch goes through the SAME
+        # svg2gcode + post-processing pipeline as outlines, we just need spacing
+        # relative to the drawing. Use viewBox width as reference:
+        #   spacing_fraction = desired_mm / width_mm (fraction of output width)
+        #   hatch_svg = spacing_fraction * viewBox_w
+        hatch_spacing_svg = args.hatch_spacing * svg_vb_w / args.width_mm
+        print(f"Hatch spacing: {args.hatch_spacing} mm -> {hatch_spacing_svg:.2f} SVG units")
+        processed_svg = apply_hatch_fill(
+            processed_svg, tmp_dir,
+            spacing=hatch_spacing_svg,
+            angle_deg=args.hatch_angle,
+            crosshatch=args.hatch_crosshatch,
+            tolerance=0.5
+        )
+
     # Build svg2gcode command (use preprocessed SVG)
     cmd = list(svg2gcode_cmd) + [
         processed_svg,
@@ -780,9 +1563,9 @@ def convert(args):
         "--nofill",         # Ignore fills (plotter cannot fill areas)
     ]
 
-    # Add computed scale factors
-    cmd += ["--scale", str(scale_x), str(scale_y)]
-    print(f"Scale: {scale_x:.4f} x {scale_y:.4f}")
+    # NOTE: We do NOT pass --scale to svg2gcode. Instead we let it output at
+    # native scale and apply our own scaling in post-processing. This avoids
+    # any unit-conversion mismatches between our SVG parsing and svg2gcode's.
 
     # Add origin offset if set (only when selfcenter is not active)
     if not args.selfcenter and (args.origin_x != 0.0 or args.origin_y != 0.0):
@@ -879,8 +1662,8 @@ def convert(args):
 
     # Post-process: convert laser gcode to plotter gcode
     print("Post-processing for plotter (replacing laser commands with Z-axis moves)...")
-    move_count, path_count = postprocess_gcode(tmp_gcode, output_path, args,
-                                                output_width_mm, output_height_mm)
+    move_count, path_count, output_width_mm, output_height_mm = postprocess_gcode(
+        tmp_gcode, output_path, args)
 
     # Clean up temp files
     try:
@@ -893,7 +1676,7 @@ def convert(args):
 
     final_size = os.path.getsize(output_path)
     print(f"\nConversion complete!")
-    print(f"Output size: {output_width_mm:.1f} x {output_height_mm:.1f} mm")
+    print(f"Output dimensions: {output_width_mm:.1f} x {output_height_mm:.1f} mm")
     print(f"Paths processed: {path_count}")
     print(f"Total moves: {move_count}")
     print(f"Output file size: {final_size} bytes")
@@ -949,8 +1732,22 @@ Examples:
                         help="Center drawing around origin")
     parser.add_argument("--rapidmove", type=int, default=10,
                         help="Rapid move threshold in mm (default: 10)")
+    parser.add_argument("--hatch-fill", type=str, default="false", dest="hatch_fill",
+                        help="Enable hatch fill for closed paths (default: false)")
+    parser.add_argument("--hatch-spacing", type=float, default=2.0, dest="hatch_spacing",
+                        help="Hatch line spacing in mm (default: 2.0)")
+    parser.add_argument("--hatch-angle", type=float, default=45.0, dest="hatch_angle",
+                        help="Hatch angle in degrees (default: 45)")
+    parser.add_argument("--hatch-crosshatch", type=str, default="false", dest="hatch_crosshatch",
+                        help="Enable crosshatch (default: false)")
 
     args = parser.parse_args()
+
+    # Parse bool flags (GUI passes them as strings "true"/"false")
+    if isinstance(args.hatch_fill, str):
+        args.hatch_fill = args.hatch_fill.lower() in ("true", "1", "yes")
+    if isinstance(args.hatch_crosshatch, str):
+        args.hatch_crosshatch = args.hatch_crosshatch.lower() in ("true", "1", "yes")
 
     convert(args)
 
