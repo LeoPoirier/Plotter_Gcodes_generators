@@ -1,0 +1,5 @@
+# Ignore all contents of the Temp folder
+Src/Temp/
+
+# Ignore the default config file
+Src/Gcode_converters/default.conf

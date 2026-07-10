@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import re
 from pathlib import Path
+import math
 
 # ═══════════════════════════════════════════════════════════════════
 # CONVERTER METADATA
@@ -361,6 +362,88 @@ def find_svg2gcode():
     return None
 
 
+
+# ═══════════════════════════════════════════════════════════════════
+# TRAVEL OPTIMIZATION: Nearest-neighbor path ordering
+# ═══════════════════════════════════════════════════════════════════
+
+def optimize_travel_order(paths):
+    """
+    Reorder a list of parsed path segments using a nearest-neighbor heuristic.
+    Each path is a list of G-code lines. The function extracts the start
+    coordinate (first move) of each path and reorders them so that after
+    finishing one path, the next path chosen is the one whose START is closest
+    to the END of the current path.
+
+    Returns the reordered list of paths.
+    """
+    if len(paths) <= 1:
+        return paths
+
+    re_coord_xy = re.compile(
+        r'(?:X\s*(-?\d+\.?\d*))\s*(?:Y\s*(-?\d+\.?\d*))', re.IGNORECASE
+    )
+
+    def get_first_coord(path_lines):
+        """Get the first XY coordinate in a path (start point)."""
+        for line in path_lines:
+            m = re_coord_xy.search(line)
+            if m:
+                return (float(m.group(1)), float(m.group(2)))
+        return (0.0, 0.0)
+
+    def get_last_coord(path_lines):
+        """Get the last XY coordinate in a path (end point)."""
+        last = (0.0, 0.0)
+        for line in path_lines:
+            m = re_coord_xy.search(line)
+            if m:
+                last = (float(m.group(1)), float(m.group(2)))
+        return last
+
+    def distance(p1, p2):
+        return math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+    # Pre-compute start and end coordinates for each path
+    starts = [get_first_coord(p) for p in paths]
+    ends = [get_last_coord(p) for p in paths]
+
+    # Nearest-neighbor greedy ordering starting from origin (0, 0)
+    n = len(paths)
+    visited = [False] * n
+    order = []
+    current_pos = (0.0, 0.0)
+
+    for _ in range(n):
+        best_idx = -1
+        best_dist = float('inf')
+        for i in range(n):
+            if visited[i]:
+                continue
+            d = distance(current_pos, starts[i])
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        visited[best_idx] = True
+        order.append(best_idx)
+        current_pos = ends[best_idx]
+
+    # Calculate improvement
+    original_travel = sum(
+        distance(ends[i], starts[i + 1]) for i in range(n - 1)
+    )
+    optimized_travel = sum(
+        distance(ends[order[i]], starts[order[i + 1]]) for i in range(n - 1)
+    )
+    if original_travel > 0:
+        saved_pct = (1 - optimized_travel / original_travel) * 100
+        print(f"  Travel optimization: {saved_pct:.1f}% reduction in travel distance")
+        print(f"    Original travel: {original_travel:.1f} mm | Optimized: {optimized_travel:.1f} mm")
+    else:
+        print(f"  Travel optimization applied (single path or zero travel)")
+
+    return [paths[i] for i in order]
+
 # ═══════════════════════════════════════════════════════════════════
 # CORE: Post-process svg2gcode output for plotter
 # ═══════════════════════════════════════════════════════════════════
@@ -369,6 +452,9 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
     """
     Read the G-code produced by svg2gcode (laser-oriented) and rewrite it
     as plotter-friendly G-code with Z-axis pen up/down movements.
+
+    Applies nearest-neighbor travel optimization to minimize pen-up travel
+    between paths.
 
     Mapping:
       - M3/M4 (laser on)  -> Pen Down: G1 Z<pen_down_z> F<z_speed>
@@ -427,71 +513,58 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
     re_m2 = re.compile(r'^M2\b', re.IGNORECASE)
     re_coord = re.compile(r'[XY]\s*-?\d+\.?\d*', re.IGNORECASE)
 
+    # ── First pass: parse raw G-code into path segments ──
+    # Each segment = [G0 travel-to-start, G1 draw, G1 draw, ...]
+    # The G0 records where the path starts; G1 lines are the drawing moves.
+    path_segments = []   # list of lists of G-code move strings
+    current_segment = []
+    pen_active = False   # tracks laser on/off in raw gcode
+
     for line in raw_lines:
         line = line.strip()
-
-        # Skip empty lines
         if not line:
             continue
 
-        # Pass through svg2gcode comment lines about paths (useful info)
+        # Skip setup/header lines from svg2gcode
         if re_comment.match(line):
-            if "path" in line.lower() or "color_coded" in line.lower():
-                output_lines.append(line)
-                if "path" in line.lower() and "ignore" not in line.lower():
-                    path_count += 1
+            if "path" in line.lower() and "ignore" not in line.lower():
+                path_count += 1
             continue
-
-        # Skip svg2gcode setup lines (we wrote our own header)
         if re_setup.match(line) or re_g21.match(line) or re_g90.match(line):
             continue
-
-        # Skip M2 (program end) - we write our own footer
         if re_m2.match(line):
             continue
 
-        # ── M3/M4 = Laser on -> Pen Down (Z-axis) ──
+        # M3/M4 = laser on = start of drawing (don't touch current_segment)
         if re_m3.match(line):
-            if not pen_is_down:
-                output_lines.append(f"{pen_down_cmd}   ; Pen down")
-                pen_is_down = True
+            pen_active = True
             continue
 
-        # ── M5 = Laser off -> Pen Up (Z-axis) ──
+        # M5 = laser off = end of a drawing segment
         if re_m5.match(line):
-            if pen_is_down:
-                output_lines.append(f"{pen_up_cmd}   ; Pen up")
-                pen_is_down = False
+            pen_active = False
+            if current_segment:
+                path_segments.append(current_segment)
+                current_segment = []
             continue
 
-        # ── G0 = Rapid move (pen should be up) ──
+        # G0 = rapid/travel move (pen is up, travelling to next path start)
         if re_g0.match(line):
-            # Ensure pen is up before travel
-            if pen_is_down:
-                output_lines.append(f"{pen_up_cmd}   ; Pen up")
-                pen_is_down = False
-
-            # Strip S and F values, add our travel speed
             coords = re_coord.findall(line)
             if coords:
                 coord_str = " ".join(coords)
-                output_lines.append(f"G0 {coord_str} F{args.travel_speed}")
-                move_count += 1
+                current_segment.append(f"G0 {coord_str} F{args.travel_speed}")
             continue
 
-        # ── G1 = Linear move (drawing) ──
+        # G1 = drawing move
         if re_g1.match(line):
-            # Strip S-values (laser power not relevant for plotter)
-            # Replace F-value with our draw speed
             coords = re_coord.findall(line)
             if coords:
                 coord_str = " ".join(coords)
-                output_lines.append(f"G1 {coord_str} F{args.draw_speed}")
-                move_count += 1
+                current_segment.append(f"G1 {coord_str} F{args.draw_speed}")
             continue
 
-        # ── Lines that are just coordinates (continuation G1) ──
-        # svg2gcode sometimes emits bare "X## Y##" lines after G1
+        # Bare coordinate lines (continuation G1)
         if re_coord.search(line) and not line.startswith(';'):
             clean = re_s_value.sub('', line)
             clean = re_f_value.sub('', clean).strip()
@@ -499,9 +572,45 @@ def postprocess_gcode(raw_gcode_path, output_path, args):
                 coords = re_coord.findall(clean)
                 if coords:
                     coord_str = " ".join(coords)
-                    output_lines.append(f"G1 {coord_str} F{args.draw_speed}")
-                    move_count += 1
+                    current_segment.append(f"G1 {coord_str} F{args.draw_speed}")
             continue
+
+    # Don't forget the last segment if file ended without M5
+    if current_segment:
+        path_segments.append(current_segment)
+
+    # ── Optimize path order using nearest-neighbor ──
+    print(f"  Found {len(path_segments)} path segment(s) to optimize...")
+    path_segments = optimize_travel_order(path_segments)
+
+    # ── Second pass: emit optimized G-code ──
+    for segment in path_segments:
+        if not segment:
+            continue
+
+        # Segment structure: [G0 travel, G1 draw, G1 draw, ...]
+        # 1. Emit G0 travel move(s) with pen up
+        # 2. Pen down
+        # 3. Emit G1 drawing moves
+        # 4. Pen up at end
+
+        for gline in segment:
+            if gline.startswith("G0"):
+                # Travel move — pen stays up
+                output_lines.append(gline)
+                move_count += 1
+            else:
+                # First G1 means we need pen down
+                if not pen_is_down:
+                    output_lines.append(f"{pen_down_cmd}   ; Pen down")
+                    pen_is_down = True
+                output_lines.append(gline)
+                move_count += 1
+
+        # Lift pen at end of this path segment
+        if pen_is_down:
+            output_lines.append(f"{pen_up_cmd}   ; Pen up")
+            pen_is_down = False
 
     # ── Write plotter footer ──
     output_lines.append("")
