@@ -209,6 +209,10 @@ class PlotterGUI:
                   background=[("active", "#6a5ae0"), ("disabled", "#44446a")])
         style.map("Reset.TButton",
                   background=[("active", "#6a6a8a")])
+        style.configure("TCheckbutton",      background=self.DARK, foreground=self.FG,
+                        font=("Segoe UI", 10))
+        style.map("TCheckbutton",
+                  background=[("active", self.DARK)])
         style.map("TCombobox",
                   fieldbackground=[("readonly", self.ENTRY)])
 
@@ -400,6 +404,9 @@ class PlotterGUI:
             saved = self.saved_defaults.get(filename, {})
             param_name = param["name"]
             if param_name in saved:
+                # Boolean parameters: return as bool
+                if param.get("type") == "bool":
+                    return saved[param_name].lower() in ("true", "1", "yes")
                 try:
                     return float(saved[param_name])
                 except (ValueError, TypeError):
@@ -430,6 +437,35 @@ class PlotterGUI:
         for i, p in enumerate(params):
             row = i + 1
             effective_default = self._get_effective_default(p)
+
+            # ==============================================================
+            # Boolean parameter -> render as a tickbox (checkbox)
+            # ==============================================================
+            if p.get("type") == "bool":
+                bool_var = tk.BooleanVar(value=bool(effective_default))
+
+                # Checkbox spanning the slider+entry columns
+                label_text = p.get("label", p["name"])
+                cb = ttk.Checkbutton(
+                    self.params_inner, text=label_text,
+                    variable=bool_var
+                )
+                cb.grid(row=row, column=0, columnspan=2, sticky="w", pady=3, padx=(0, 8))
+
+                # Optional description as dim label in the unit column
+                desc = p.get("description", "")
+                if desc:
+                    ttk.Label(self.params_inner, text=desc,
+                              style="Dim.TLabel").grid(
+                        row=row, column=2, columnspan=2, sticky="w", padx=(2, 0))
+
+                # Store: (param_info, entry_var=None, slider=None, var=BooleanVar)
+                self.param_widgets.append((p, None, None, bool_var))
+                continue
+
+            # ==============================================================
+            # Numeric parameter (int / float) -> slider + entry (original)
+            # ==============================================================
             var = tk.DoubleVar(value=effective_default)
 
             # Label
@@ -527,7 +563,11 @@ class PlotterGUI:
         filename = self.current_converter["filename"]
         param_values = {}
         for param_info, entry_var, slider, var in self.param_widgets:
-            param_values[param_info["name"]] = entry_var.get().strip()
+            if param_info.get("type") == "bool":
+                # Boolean: store "true" / "false"
+                param_values[param_info["name"]] = "true" if var.get() else "false"
+            else:
+                param_values[param_info["name"]] = entry_var.get().strip()
 
         self.saved_defaults[filename] = param_values
         save_defaults(self.saved_defaults)
@@ -545,6 +585,13 @@ class PlotterGUI:
 
         for (param_info, entry_var, slider, var), p in zip(self.param_widgets, params):
             original_default = p["default"]
+
+            # Boolean: just reset the BooleanVar
+            if param_info.get("type") == "bool":
+                var.set(bool(original_default))
+                continue
+
+            # Numeric (int/float): reset slider + entry
             p_min = p.get("min", 0)
             p_max = p.get("max", 100)
 
@@ -668,7 +715,11 @@ class PlotterGUI:
 
         for param_info, entry_var, slider, var in self.param_widgets:
             flag = param_info["flag"]
-            value = entry_var.get().strip()
+            if param_info.get("type") == "bool":
+                # Boolean: pass "true" or "false"
+                value = "true" if var.get() else "false"
+            else:
+                value = entry_var.get().strip()
             if value:
                 cmd.extend([flag, value])
 
