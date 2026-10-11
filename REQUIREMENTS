@@ -1,3 +1,6 @@
 opencv-python-headless
 numpy
 Pillow
+svg2gcode
+matplotlib
+cairosvg

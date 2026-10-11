@@ -8,6 +8,7 @@ Features:
   - Dynamically builds sliders + editable value fields per converter
   - Dropdown to switch between converters
   - Converter illustration image support
+  - Input preview for raster images, SVG (vector) and text/G-code files
   - Editable fields allow values beyond slider range (slider greys out)
   - Saves last-used parameter values to Gcode_converters/default.conf
   - Reset button restores original parameter defaults from --get-params
@@ -25,7 +26,7 @@ Folder structure:
         some_other_converter.png         <- optional illustration
         ...
 
-Requirements: pillow, numpy
+Requirements: pillow, numpy  (optional: cairosvg or svglib for SVG preview)
 """
 
 import tkinter as tk
@@ -34,7 +35,28 @@ import subprocess
 import json
 import sys
 import os
+import io
+import re
+import xml.etree.ElementTree as ET
 from PIL import Image, ImageTk
+
+# ------------------------------------------------------------------------------
+# OPTIONAL SVG SUPPORT
+# ------------------------------------------------------------------------------
+# Pillow cannot read SVG (it is vector XML), so it must be rasterized first.
+# Preferred backend: cairosvg.  Fallback: svglib + reportlab (pure Python).
+# If neither is installed the GUI still works; SVG previews just show a hint.
+#     pip install cairosvg        (or)    pip install svglib reportlab
+try:
+    import cairosvg
+    _SVG_BACKEND = "cairosvg"
+except Exception:
+    try:
+        from svglib.svglib import svg2rlg
+        from reportlab.graphics import renderPM
+        _SVG_BACKEND = "svglib"
+    except Exception:
+        _SVG_BACKEND = None
 
 
 # ==============================================================================
@@ -144,6 +166,11 @@ def discover_converters():
 # ==============================================================================
 
 PREVIEW_SIZE = 280  # pixels for image preview area
+
+# File types the preview pane knows how to render
+RASTER_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif", ".webp"}
+VECTOR_EXTS = {".svg"}
+TEXT_EXTS   = {".gcode", ".nc", ".ngc", ".txt", ".dxf"}
 
 
 class PlotterGUI:
@@ -621,7 +648,11 @@ class PlotterGUI:
 
     def _browse_input(self):
         # Dynamically use filetypes declared by the active converter
-        default_types = [("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff"), ("All files", "*.*")]
+        default_types = [
+            ("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff"),
+            ("SVG files", "*.svg"),
+            ("All files", "*.*"),
+        ]
 
         if self.current_converter:
             raw = self.current_converter["info"].get("input_types", default_types)
@@ -650,41 +681,114 @@ class PlotterGUI:
             self.output_var.set(path)
 
     def _load_preview(self, path):
-        """Load image preview into the canvas, properly scaled."""
-        # Only attempt image preview for known image formats
-        IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".gif"}
+        """Dispatch to the right renderer for the selected input file."""
         ext = os.path.splitext(path)[1].lower()
 
-        if ext not in IMAGE_EXTS:
-            self.preview_canvas.delete("all")
-            self.preview_canvas.create_text(
-                PREVIEW_SIZE // 2, PREVIEW_SIZE // 2,
-                text=f"No preview for\n{ext} files",
-                fill=self.FG2, font=("Segoe UI", 10)
-            )
-            return
-
         try:
-            img = Image.open(path)
-            # Scale to fit the preview area while maintaining aspect ratio
-            img.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.LANCZOS)
-            photo = ImageTk.PhotoImage(img)
-
-            # Clear canvas and draw centered image
-            self.preview_canvas.delete("all")
-            self.preview_canvas.create_image(
-                PREVIEW_SIZE // 2, PREVIEW_SIZE // 2,
-                anchor="center", image=photo
-            )
-            # Keep a reference to prevent garbage collection
-            self.preview_canvas._photo = photo
+            if ext in RASTER_EXTS:
+                self._draw_image(Image.open(path))
+            elif ext in VECTOR_EXTS:
+                self._draw_image(self._render_svg(path, PREVIEW_SIZE))
+            elif ext in TEXT_EXTS:
+                self._preview_text_file(path)
+            else:
+                self._preview_message(f"No preview for\n{ext} files")
         except Exception as e:
-            self.preview_canvas.delete("all")
-            self.preview_canvas.create_text(
-                PREVIEW_SIZE // 2, PREVIEW_SIZE // 2,
-                text=f"Preview error:\n{e}",
-                fill=self.FG2, font=("Segoe UI", 9)
+            self._preview_message(f"Preview error:\n{e}", small=True)
+
+    # --------------------------------------------------------------------------
+    # Preview renderers
+    # --------------------------------------------------------------------------
+
+    @staticmethod
+    def _svg_aspect(path):
+        """Return width/height of an SVG from its viewBox (1.0 if unknown)."""
+        try:
+            root = ET.parse(path).getroot()
+            vb = root.get("viewBox")
+            if vb:
+                parts = [float(v) for v in re.split(r"[ ,]+", vb.strip())]
+                if len(parts) == 4 and parts[3]:
+                    return parts[2] / parts[3]
+        except Exception:
+            pass
+        return 1.0
+
+    def _render_svg(self, path, size):
+        """Rasterize an SVG to a PIL Image fitted inside size x size px."""
+        if _SVG_BACKEND is None:
+            raise RuntimeError(
+                "SVG preview needs an extra package:\n"
+                "pip install cairosvg\n(or: pip install svglib reportlab)"
             )
+
+        if _SVG_BACKEND == "cairosvg":
+            # Give only one dimension so cairosvg keeps the aspect ratio
+            aspect = self._svg_aspect(path)
+            kwargs = {"output_width": size} if aspect >= 1.0 else {"output_height": size}
+            png_bytes = cairosvg.svg2png(
+                url=path,
+                background_color="white",   # SVGs are usually transparent
+                **kwargs
+            )
+            return Image.open(io.BytesIO(png_bytes))
+
+        # ---- svglib fallback ----
+        drawing = svg2rlg(path)
+        if drawing is None:
+            raise RuntimeError("Could not parse SVG")
+        w = max(drawing.width or 1, 1)
+        h = max(drawing.height or 1, 1)
+        scale = min(size / w, size / h)
+        drawing.scale(scale, scale)
+        drawing.width = w * scale
+        drawing.height = h * scale
+        return renderPM.drawToPIL(drawing, bg=0xFFFFFF)
+
+    def _preview_text_file(self, path, max_lines=20):
+        """Show the first lines of a text-based input (G-code, DXF, ...)."""
+        lines = []
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(max_lines):
+                line = f.readline()
+                if not line:
+                    break
+                lines.append(line.rstrip())
+        text = "\n".join(lines).strip()
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_text(
+            8, 8, anchor="nw",
+            text=text or "(empty file)",
+            fill=self.FG2, font=("Consolas", 8),
+            width=PREVIEW_SIZE - 16
+        )
+
+    # --------------------------------------------------------------------------
+    # Canvas helpers
+    # --------------------------------------------------------------------------
+
+    def _draw_image(self, img):
+        """Scale a PIL image to fit the canvas and draw it centered."""
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA")
+        img.thumbnail((PREVIEW_SIZE, PREVIEW_SIZE), Image.LANCZOS)
+        photo = ImageTk.PhotoImage(img)
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_image(
+            PREVIEW_SIZE // 2, PREVIEW_SIZE // 2,
+            anchor="center", image=photo
+        )
+        self.preview_canvas._photo = photo   # keep reference, prevent GC
+
+    def _preview_message(self, text, small=False):
+        """Show a centered placeholder / error message in the preview area."""
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_text(
+            PREVIEW_SIZE // 2, PREVIEW_SIZE // 2,
+            text=text, fill=self.FG2,
+            font=("Segoe UI", 9 if small else 10),
+            justify="center"
+        )
 
     # --------------------------------------------------------------------------
     # Run converter
